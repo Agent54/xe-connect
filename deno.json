@@ -1,0 +1,7 @@
+{
+  "tasks": {
+    "demo": "deno run --allow-net=127.0.0.1 --allow-read=. --allow-write=target --allow-run=cargo,deno,target/debug/xe-connect scripts/demo.ts",
+    "test:demo": "deno test --allow-net=127.0.0.1 --allow-read=. --allow-write=target --allow-run=cargo,deno,target/debug/xe-connect scripts/demo_test.ts",
+    "check": "deno check scripts/demo.ts scripts/demo_test.ts"
+  }
+}
