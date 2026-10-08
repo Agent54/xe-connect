@@ -38,6 +38,14 @@ impl RuntimeConfig {
         self.snapshot.read().unwrap().clone()
     }
 
+    pub fn write_busy(&self) -> bool {
+        self.writes.try_lock().is_err()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     pub async fn update<R: Send + 'static>(
         &self,
         update: impl FnOnce(&mut Config) -> Result<R> + Send + 'static,

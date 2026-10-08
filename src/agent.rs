@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
     fs::File,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -55,12 +58,25 @@ const MAX_PENDING_PAIRINGS: usize = 4;
 const MAX_HTTP_CONNECTIONS: usize = 64;
 const MAX_REQUESTS: usize = 64;
 const PAIRING_WINDOW: Duration = Duration::from_secs(60);
+const MAX_PAIRING_ATTEMPTS_PER_IDENTITY: usize = 8;
+const MAX_PAIRING_ATTEMPTS_GLOBAL: usize = 32;
+const UPSTREAM_POOL_MAX_IDLE: usize = 4;
+const UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DISCOVERY_MISS_BACKOFF: Duration = Duration::from_secs(1);
 type Stream = (SendStream, RecvStream);
 type Dial = Shared<BoxFuture<'static, std::result::Result<Connection, Arc<str>>>>;
 
 struct PeerConnection {
     attempt: Dial,
     started: Instant,
+}
+
+#[derive(Clone)]
+struct LiveConnection {
+    connection: Connection,
+    started: Instant,
+    trusted: Arc<AtomicBool>,
+    auth_deadline: Deadline,
 }
 
 enum ConnectionSlot {
@@ -77,8 +93,9 @@ impl PairingRate {
     fn allow(&mut self, caller: PublicKey) -> bool {
         self.attempts
             .retain(|(_, time)| time.elapsed() < PAIRING_WINDOW);
-        if self.attempts.len() >= 32
-            || self.attempts.iter().filter(|(id, _)| *id == caller).count() >= 8
+        if self.attempts.len() >= MAX_PAIRING_ATTEMPTS_GLOBAL
+            || self.attempts.iter().filter(|(id, _)| *id == caller).count()
+                >= MAX_PAIRING_ATTEMPTS_PER_IDENTITY
         {
             return false;
         }
@@ -94,7 +111,7 @@ pub struct Agent {
     endpoint: Endpoint,
     client: Client<HttpsConnector<HttpConnector>, Body>,
     connections: Mutex<HashMap<PublicKey, PeerConnection>>,
-    live_connections: Mutex<Vec<Connection>>,
+    live_connections: Mutex<Vec<LiveConnection>>,
     lookups: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     misses: Mutex<HashMap<String, Instant>>,
     tasks: Arc<Tasks>,
@@ -107,6 +124,7 @@ pub struct Agent {
     pairing_rate: Mutex<PairingRate>,
     closing: Mutex<()>,
     agent_lock: std::sync::Mutex<Option<File>>,
+    started: Instant,
 }
 
 impl Agent {
@@ -156,8 +174,8 @@ impl Agent {
             endpoint,
             client: Client::builder(Executor(tasks.clone()))
                 .pool_timer(TokioTimer::new())
-                .pool_idle_timeout(Duration::from_secs(30))
-                .pool_max_idle_per_host(4)
+                .pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
+                .pool_max_idle_per_host(UPSTREAM_POOL_MAX_IDLE)
                 .build(connector),
             connections: Mutex::new(HashMap::new()),
             live_connections: Mutex::new(Vec::new()),
@@ -173,6 +191,7 @@ impl Agent {
             pairing_rate: Mutex::new(PairingRate::default()),
             closing: Mutex::new(()),
             agent_lock: std::sync::Mutex::new(Some(guard)),
+            started: Instant::now(),
         });
         let acceptor = agent.clone();
         agent.tasks.spawn(async move {
@@ -287,9 +306,9 @@ impl Agent {
             .lock()
             .await
             .iter()
-            .filter(|connection| connection.remote_id() == id)
+            .filter(|live| live.connection.remote_id() == id)
         {
-            connection.close(1u8.into(), b"peer removed");
+            connection.connection.close(1u8.into(), b"peer removed");
         }
         self.connections.lock().await.remove(&id);
         self.misses.lock().await.clear();
@@ -522,6 +541,7 @@ impl Agent {
         }
         match (request.method().clone(), request.uri().path()) {
             (Method::GET, "/_xe/self") => Ok(http::json(self.peer()?)),
+            (Method::GET, "/_xe/diagnostics") => Ok(http::json(self.diagnostics().await)),
             (Method::POST, "/_xe/config") => {
                 let bytes = Limited::new(request.into_body(), 4096)
                     .collect()
@@ -682,10 +702,16 @@ impl Agent {
         slot: ConnectionSlot,
         auth_deadline: Deadline,
     ) {
+        let trusted = Arc::new(AtomicBool::new(matches!(&slot, ConnectionSlot::Trusted(_))));
         {
             let mut live = self.live_connections.lock().await;
-            live.retain(|connection| connection.close_reason().is_none());
-            live.push(connection.clone());
+            live.retain(|live| live.connection.close_reason().is_none());
+            live.push(LiveConnection {
+                connection: connection.clone(),
+                started: Instant::now(),
+                trusted: trusted.clone(),
+                auth_deadline,
+            });
         }
         let _permit = match slot {
             ConnectionSlot::Trusted(permit) => permit,
@@ -694,6 +720,7 @@ impl Agent {
                 // Pending streams are processed serially, bounding their request use too.
                 match timeout_at(auth_deadline, self.authenticate(&connection)).await {
                     Ok(Ok(permit)) => {
+                        trusted.store(true, Ordering::Release);
                         drop(pending);
                         permit
                     }
@@ -1006,7 +1033,7 @@ impl Agent {
             .lock()
             .await
             .get(hostname)
-            .is_some_and(|time| time.elapsed() < Duration::from_secs(1))
+            .is_some_and(|time| time.elapsed() < DISCOVERY_MISS_BACKOFF)
         {
             return Ok(None);
         }
@@ -1062,7 +1089,7 @@ impl Agent {
             }
         }
         let mut misses = self.misses.lock().await;
-        misses.retain(|_, time| time.elapsed() < Duration::from_secs(1));
+        misses.retain(|_, time| time.elapsed() < DISCOVERY_MISS_BACKOFF);
         misses.insert(hostname.into(), Instant::now());
         Ok(None)
     }
@@ -1214,6 +1241,9 @@ impl Agent {
         }
     }
 }
+
+#[path = "diagnostics.rs"]
+mod diagnostics;
 
 pub fn create_invitation(store: &StateStore, peer: Peer, lifetime: Duration) -> Result<Ticket> {
     let ticket = new_invitation(peer, lifetime)?;

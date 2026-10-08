@@ -25,6 +25,10 @@ impl<F: Future + Send + 'static> hyper::rt::Executor<F> for Executor {
 }
 
 impl Tasks {
+    pub fn len(&self) -> usize {
+        self.tracker.len()
+    }
+
     pub fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) -> bool {
         let closed = self.closed.lock().unwrap();
         if *closed {

@@ -253,6 +253,18 @@ impl Node {
             .request(request)
             .await?)
     }
+
+    async fn diagnostics(&self, token: Option<&str>) -> Result<Response<Incoming>> {
+        let mut request =
+            Request::builder().uri(format!("http://{}/_xe/diagnostics", self.address));
+        if let Some(token) = token {
+            request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        Ok(Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(request.body(http::full(""))?)
+            .await?)
+    }
 }
 
 impl Drop for Node {
@@ -1020,6 +1032,193 @@ async fn trusted_gateway_preserves_https_locally_and_across_peers() -> Result<()
         }
     }
     a.agent.close().await;
+    b.agent.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_are_authenticated_secret_free_and_read_only() -> Result<()> {
+    let empty = Gateway::start(&[]).await?;
+    let backend = Gateway::start(&["app.localhost"]).await?;
+    let a = Node::start(&empty, "A").await?;
+    let b = Node::start(&backend, "B").await?;
+    a.pair_with(&b).await?;
+    let response = a
+        .request(Method::POST, "app.localhost", "/diagnostic-traffic")
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().collect().await?;
+    let invitation = a.agent.invite(Duration::from_secs(600)).await?;
+
+    for token in [None, Some("wrong-token")] {
+        let response = a.diagnostics(token).await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.into_body().collect().await?.to_bytes();
+        assert!(!String::from_utf8_lossy(&body).contains("endpoint_id"));
+    }
+    // An application hostname must never enter the local control handler.
+    let response = a
+        .request(Method::GET, "app.localhost", "/_xe/diagnostics")
+        .await?;
+    let app_body: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+    assert!(app_body.get("schema_version").is_none());
+
+    let stranger = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")?
+        .bind()
+        .await?;
+    let pending = stranger
+        .connect(a.agent.endpoint.addr(), protocol::ALPN)
+        .await?;
+    timeout(Duration::from_secs(2), async {
+        while a.agent.pending_slots.available_permits() != MAX_PENDING_PAIRINGS - 1
+            || a.agent
+                .live_connections
+                .lock()
+                .await
+                .iter()
+                .all(|live| live.connection.remote_id() != stranger.id())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let lock = File::options()
+        .read(true)
+        .write(true)
+        .open(a.agent.store.directory().join("config.lock"))?;
+    lock.lock()?;
+    let path = a.agent.store.directory().join("config.json");
+    let before = std::fs::metadata(&path)?.modified()?;
+    let heads = backend.heads.load(Ordering::SeqCst);
+    let token = a.agent.config().control_token.clone();
+    let response = timeout(Duration::from_secs(2), a.diagnostics(Some(&token))).await??;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let bytes = response.into_body().collect().await?.to_bytes();
+    let encoded = String::from_utf8(bytes.to_vec())?;
+    for secret in [
+        &token,
+        &b.agent.config().control_token,
+        &invitation.token,
+        &invitation.encode()?,
+    ] {
+        assert!(!encoded.contains(secret), "diagnostics leaked a secret");
+    }
+    let value: serde_json::Value = serde_json::from_str(&encoded)?;
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(
+        value["agent"]["endpoint_id"],
+        a.agent.endpoint.id().to_string()
+    );
+    assert_eq!(value["agent"]["profile"]["device_name"], "A");
+    assert_eq!(
+        value["discovery"]["routes"]["app.localhost"],
+        b.agent.endpoint.id().to_string()
+    );
+    assert_eq!(value["resources"]["trusted_connections"]["used"], 1);
+    assert_eq!(value["resources"]["pending_pairings"]["used"], 1);
+    assert_eq!(
+        value["resources"]["pending_pairings"]["limit"],
+        MAX_PENDING_PAIRINGS
+    );
+    assert_eq!(
+        value["resources"]["request_handlers"]["used"], 1,
+        "the diagnostic request counts as a handler"
+    );
+    assert_eq!(value["pairing"]["invitations"]["unredeemed"], 1);
+    assert_eq!(value["dial_cache"][0]["state"], "connected");
+    assert!(
+        value["iroh"]["metrics"]["socket"]["num_conns_opened"]["value"]
+            .as_u64()
+            .unwrap()
+            >= 2
+    );
+    assert!(value["iroh"]["metric_descriptions"]["socket"]["paths_direct"].is_string());
+    assert!(value["iroh"]["metric_descriptions"]["address_lookup"]["service_errors"].is_string());
+    assert_eq!(value["iroh"]["home_relays"], serde_json::json!([]));
+    let connections = value["connections"].as_array().unwrap();
+    let trusted = connections
+        .iter()
+        .find(|entry| entry["peer_id"] == b.agent.endpoint.id().to_string())
+        .unwrap();
+    assert_eq!(trusted["admission"], "trusted");
+    assert_eq!(trusted["direction"], "outbound");
+    assert!(trusted["authentication_remaining_ms"].is_null());
+    assert!(trusted["stats"]["tx"]["bytes"].as_u64().unwrap() > 0);
+    assert!(trusted["stats"]["frames_tx"]["stream"].as_u64().unwrap() > 0);
+    let selected = trusted["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|path| path["selected"] == true)
+        .unwrap();
+    assert_eq!(selected["kind"], "direct_ip");
+    assert!(selected["stats"]["rtt_ms"].as_f64().unwrap() > 0.0);
+    assert!(selected["stats"]["mtu_bytes"].as_u64().unwrap() > 0);
+    let unknown = connections
+        .iter()
+        .find(|entry| entry["peer_id"] == stranger.id().to_string())
+        .unwrap();
+    assert_eq!(unknown["admission"], "pending_pairing");
+    assert!(unknown["authentication_remaining_ms"].as_u64().unwrap() <= 10_000);
+    assert_eq!(std::fs::metadata(&path)?.modified()?, before);
+    assert_eq!(
+        backend.heads.load(Ordering::SeqCst),
+        heads,
+        "diagnostics must not probe apps"
+    );
+    lock.unlock()?;
+    pending.close(0u8.into(), b"test complete");
+    stranger.close().await;
+    a.agent.close().await;
+    b.agent.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_report_unknown_remote_state_and_completed_shutdown_without_dialing()
+-> Result<()> {
+    let gateway = Gateway::start(&[]).await?;
+    let a = Node::start(&gateway, "A").await?;
+    let b = Node::start(&gateway, "B").await?;
+    let peer = b.agent.peer()?;
+    let id = peer.address.id.to_string();
+    a.agent
+        .update_config(move |config| {
+            config
+                .routes
+                .insert("saved.localhost".into(), peer.address.id.to_string());
+            config.peers.insert(peer.address.id.to_string(), peer);
+            Ok(())
+        })
+        .await?;
+    let value = a.agent.diagnostics().await;
+    assert_eq!(value["peers"][0]["peer_id"], id);
+    assert_eq!(value["peers"][0]["iroh_remote_info"]["status"], "not_known");
+    assert_eq!(
+        value["peers"][0]["active_connection_ids"],
+        serde_json::json!([])
+    );
+    assert_eq!(value["connections"], serde_json::json!([]));
+    assert_eq!(value["dial_cache"], serde_json::json!([]));
+    assert_eq!(value["discovery"]["routes"]["saved.localhost"], id);
+    assert_eq!(
+        value["iroh"]["metrics"]["socket"]["num_conns_opened"]["value"],
+        0
+    );
+    assert_eq!(gateway.heads.load(Ordering::SeqCst), 0);
+    a.agent.close().await;
+    let value = timeout(Duration::from_secs(2), a.agent.diagnostics()).await?;
+    assert_eq!(value["agent"]["closing"], true);
+    assert_eq!(value["agent"]["identity_lock_held"], false);
+    assert_eq!(value["agent"]["persistence"]["closed"], true);
+    assert_eq!(value["iroh"]["closed"], true);
+    assert_eq!(value["resources"]["tracked_tasks"], 0);
+    assert_eq!(value["resources"]["trusted_connections"]["used"], 0);
     b.agent.close().await;
     Ok(())
 }
