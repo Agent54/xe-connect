@@ -4,4 +4,6 @@
 /config.lock
 /agent.lock
 /config.json.new
+/ui/dist/
+/ui/node_modules/
 

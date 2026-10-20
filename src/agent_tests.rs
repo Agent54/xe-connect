@@ -265,6 +265,28 @@ impl Node {
             .request(request.body(http::full(""))?)
             .await?)
     }
+
+    async fn control_request(
+        &self,
+        method: Method,
+        path: &str,
+        value: serde_json::Value,
+        authorized: bool,
+    ) -> Result<Response<Incoming>> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(format!("http://{}{path}", self.address));
+        if authorized {
+            request = request.header(
+                AUTHORIZATION,
+                format!("Bearer {}", self.agent.config().control_token),
+            );
+        }
+        Ok(Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(request.body(http::full(serde_json::to_vec(&value)?))?)
+            .await?)
+    }
 }
 
 impl Drop for Node {
@@ -275,6 +297,113 @@ impl Drop for Node {
             agent.close().await;
         });
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_test_uses_normal_routing_without_forwarding_control_credentials() -> Result<()> {
+    let a_gateway = Gateway::start(&["alpha.localhost"]).await?;
+    let b_gateway = Gateway::start(&["beta.web.localhost"]).await?;
+    let a = Node::start(&a_gateway, "A").await?;
+    let b = Node::start(&b_gateway, "B").await?;
+    let body = serde_json::json!({ "hostname": "beta.web.localhost" });
+    let rejected = a
+        .control_request(Method::POST, "/_xe/test", body.clone(), false)
+        .await?;
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(a_gateway.heads.load(Ordering::SeqCst), 0);
+    assert!(a.agent.test_service("example.com").await.is_err());
+    assert!(
+        a.agent
+            .test_service("http://alpha.localhost/")
+            .await
+            .is_err()
+    );
+    assert_eq!(a_gateway.heads.load(Ordering::SeqCst), 0);
+
+    let local = a.agent.test_service("alpha.localhost").await?;
+    assert_eq!(local["provider"], "local");
+    assert_eq!(local["status"], 200);
+    let missing = a.agent.test_service("beta.web.localhost").await?;
+    assert_eq!(missing["provider"], "none");
+    assert_eq!(missing["status"], 404);
+    a.pair_with(&b).await?;
+    let response = a
+        .control_request(Method::POST, "/_xe/test", body, true)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await?.to_bytes();
+    let remote: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(remote["provider"], "peer");
+    assert_eq!(remote["peer_id"], b.agent.endpoint.id().to_string());
+    assert_eq!(remote["status"], 200);
+    let preview = remote["body_preview"].as_str().unwrap();
+    assert!(!preview.contains(&a.agent.config().control_token));
+    assert!(!preview.contains("Bearer"));
+    assert_eq!(
+        a.agent.config().routes["beta.web.localhost"],
+        b.agent.endpoint.id().to_string()
+    );
+    a.agent.close().await;
+    b.agent.close().await;
+    Ok(())
+}
+
+#[cfg(feature = "web-ui")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedded_ui_is_a_public_shell_only_on_the_local_control_host() -> Result<()> {
+    let gateway = Gateway::start(&[]).await?;
+    let node = Node::start(&gateway, "UI").await?;
+    let response = node
+        .control_request(Method::GET, "/_xe/ui/", serde_json::Value::Null, false)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(
+        response.headers()["content-security-policy"]
+            .to_str()?
+            .contains("frame-ancestors 'none'")
+    );
+    let html = String::from_utf8(response.into_body().collect().await?.to_bytes().to_vec())?;
+    assert!(!html.contains(&node.agent.config().control_token));
+    let assets: Vec<_> = html
+        .split('"')
+        .filter(|value| value.starts_with("/_xe/ui/assets/"))
+        .collect();
+    assert_eq!(assets.len(), 2);
+    for path in assets {
+        let response = node
+            .control_request(Method::GET, path, serde_json::Value::Null, false)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.into_body().collect().await?.to_bytes().is_empty());
+        let response = node
+            .control_request(Method::HEAD, path, serde_json::Value::Null, false)
+            .await?;
+        assert!(response.into_body().collect().await?.to_bytes().is_empty());
+    }
+    let unknown = node
+        .control_request(
+            Method::GET,
+            "/_xe/ui/../config.json",
+            serde_json::Value::Null,
+            false,
+        )
+        .await?;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let app = node
+        .request(Method::GET, "some.localhost", "/_xe/ui/")
+        .await?;
+    assert_eq!(app.status(), StatusCode::NOT_FOUND);
+    let post = node
+        .control_request(Method::POST, "/_xe/ui/", serde_json::Value::Null, false)
+        .await?;
+    assert_eq!(post.status(), StatusCode::METHOD_NOT_ALLOWED);
+    node.agent.close().await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

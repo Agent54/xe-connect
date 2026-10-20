@@ -6,6 +6,10 @@ rust-version = "1.91"
 license = "Apache-2.0"
 description = "A small HTTP bridge between paired iroh computers"
 
+[features]
+default = ["web-ui"]
+web-ui = []
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

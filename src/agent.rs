@@ -63,6 +63,9 @@ const MAX_PAIRING_ATTEMPTS_GLOBAL: usize = 32;
 const UPSTREAM_POOL_MAX_IDLE: usize = 4;
 const UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DISCOVERY_MISS_BACKOFF: Duration = Duration::from_secs(1);
+
+#[path = "service_test.rs"]
+mod service_test;
 type Stream = (SendStream, RecvStream);
 type Dial = Shared<BoxFuture<'static, std::result::Result<Connection, Arc<str>>>>;
 
@@ -468,6 +471,12 @@ impl Agent {
                         .parse::<std::net::IpAddr>()
                         .is_ok_and(|ip| ip.is_loopback())
             });
+        #[cfg(feature = "web-ui")]
+        if control
+            && (request.uri().path() == "/_xe/ui" || request.uri().path().starts_with("/_xe/ui/"))
+        {
+            return crate::ui::serve(request.method(), request.uri().path());
+        }
         if control && request.uri().path().starts_with("/_xe/") {
             return match self.control(request).await {
                 Ok(response) => response,
@@ -493,7 +502,7 @@ impl Agent {
         };
         if self.probe(&hostname).await {
             return match self
-                .forward_local(request, &hostname, None, scheme, lease)
+                .forward_local(request.map(http::body), &hostname, None, scheme, lease)
                 .await
             {
                 Ok(response) => response,
@@ -502,7 +511,10 @@ impl Agent {
         }
         match self.remote_stream(&hostname, scheme).await {
             Ok(Some((peer_id, stream))) => {
-                match self.forward_remote(request, stream, lease).await {
+                match self
+                    .forward_remote(request.map(http::body), stream, lease)
+                    .await
+                {
                     Ok(response) => {
                         if response.headers().contains_key(ERROR_HEADER) {
                             let _ = self.invalidate(&hostname, &peer_id).await;
@@ -542,6 +554,20 @@ impl Agent {
         match (request.method().clone(), request.uri().path()) {
             (Method::GET, "/_xe/self") => Ok(http::json(self.peer()?)),
             (Method::GET, "/_xe/diagnostics") => Ok(http::json(self.diagnostics().await)),
+            (Method::POST, "/_xe/test") => {
+                let bytes = Limited::new(request.into_body(), 256)
+                    .collect()
+                    .await
+                    .map_err(anyhow::Error::from_boxed)?
+                    .to_bytes();
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Test {
+                    hostname: String,
+                }
+                let input: Test = serde_json::from_slice(&bytes)?;
+                Ok(http::json(self.test_service(&input.hostname).await?))
+            }
             (Method::POST, "/_xe/config") => {
                 let bytes = Limited::new(request.into_body(), 4096)
                     .collect()
@@ -901,7 +927,13 @@ impl Agent {
                             http::error(StatusCode::FORBIDDEN, "not_paired", "peer was removed")
                         } else {
                             match agent
-                                .forward_local(request, &hostname, Some(caller), scheme, lease)
+                                .forward_local(
+                                    request.map(http::body),
+                                    &hostname,
+                                    Some(caller),
+                                    scheme,
+                                    lease,
+                                )
                                 .await
                             {
                                 Ok(response) => response,
@@ -1109,7 +1141,7 @@ impl Agent {
 
     async fn forward_local(
         &self,
-        mut request: Request<Incoming>,
+        mut request: Request<Body>,
         hostname: &str,
         caller: Option<PublicKey>,
         scheme: Scheme,
@@ -1138,7 +1170,7 @@ impl Agent {
                 .insert(SOURCE_HEADER, caller.to_string().parse()?);
         }
         *request.uri_mut() = uri;
-        let mut response = timeout(HEADER_TIMEOUT, self.client.request(request.map(http::body)))
+        let mut response = timeout(HEADER_TIMEOUT, self.client.request(request))
             .await
             .context("upstream response timed out")??;
         self.bridge_upgrade(downstream, &mut response, lease);
@@ -1149,7 +1181,7 @@ impl Agent {
 
     async fn forward_remote(
         &self,
-        mut request: Request<Incoming>,
+        mut request: Request<Body>,
         (send, receive): Stream,
         lease: Arc<OwnedSemaphorePermit>,
     ) -> Result<Response<Body>> {
@@ -1170,7 +1202,7 @@ impl Agent {
         self.tasks.spawn(async move {
             let _ = connection.with_upgrades().await;
         });
-        let mut response = timeout_at(deadline, sender.send_request(request.map(http::body)))
+        let mut response = timeout_at(deadline, sender.send_request(request))
             .await
             .context("peer response timed out; request was not replayed")??;
         self.bridge_upgrade(downstream, &mut response, lease);

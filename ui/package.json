@@ -1,0 +1,13 @@
+{
+  "name": "xe-connect-ui",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.0.0",
+    "@types/node": "24.12.2",
+    "svelte": "5.55.1",
+    "svelte-check": "4.4.6",
+    "typescript": "6.0.2",
+    "vite": "8.2.2"
+  }
+}

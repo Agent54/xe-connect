@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { buildBinary, Computer, Demo, ROOT } from "./demo.ts";
+import { encodeTicket } from "../ui/src/api.ts";
 
 function freeBasePort() {
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -40,6 +41,23 @@ async function request(
   return { status: response.status, payload: await response.json() };
 }
 
+async function control(computer: Computer, path: string, value?: unknown) {
+  const url = new URL(await computer.command("ui"));
+  const token = new URLSearchParams(url.hash.slice(1)).get("token");
+  assert.ok(token);
+  const response = await fetch(new URL(`/_xe/${path}`, url), {
+    method: value === undefined ? "GET" : "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: value === undefined ? undefined : JSON.stringify(value),
+    signal: AbortSignal.timeout(25000),
+  });
+  assert.equal(response.status, 200);
+  return await response.json();
+}
+
 Deno.test("manual pairing makes both isolated dummy services reachable", async () => {
   await buildBinary();
   const testDirectory = join(ROOT, "target/demo-tests");
@@ -75,9 +93,20 @@ Deno.test("manual pairing makes both isolated dummy services reachable", async (
     }
     assert.equal((await request(client, a, b.hostname)).status, 404);
     assert.equal((await request(client, b, a.hostname)).status, 404);
-    const ticket = await a.command("invite");
+    const uiUrl = new URL(await a.command("ui"));
+    uiUrl.hash = "";
+    const shell = await fetch(uiUrl);
+    assert.equal(shell.status, 200);
+    assert.match(await shell.text(), /\/\_xe\/ui\/assets\/.+\.js/);
+    const unauthorized = await fetch(new URL("/_xe/diagnostics", uiUrl));
+    assert.equal(unauthorized.status, 401);
+    await unauthorized.body?.cancel();
+    const before = await control(a, "test", { hostname: b.hostname });
+    assert.equal(before.provider, "none");
+    assert.equal(before.status, 404);
+    const ticket = encodeTicket(await control(a, "invite", 600));
     assert.ok(ticket.startsWith("xe1:"));
-    await b.command("pair", ticket);
+    await control(b, "pair", ticket);
     for (
       const [caller, provider, callerId, providerId] of [[a, b, aId, bId], [
         b,
@@ -106,8 +135,20 @@ Deno.test("manual pairing makes both isolated dummy services reachable", async (
       const peers = JSON.parse(await caller.command("peers"));
       assert.equal(peers.peers[providerId].profile.device_name, provider.name);
       assert.equal(peers.routes[provider.hostname], providerId);
+      const checked = await control(caller, "test", {
+        hostname: provider.hostname,
+      });
+      assert.equal(checked.status, 200);
+      assert.equal(checked.provider, "peer");
+      assert.equal(checked.peer_id, providerId);
+      const echo = JSON.parse(checked.body_preview);
+      assert.equal(echo.computer, provider.name);
+      assert.equal(echo.method, "GET");
+      assert.equal(echo.body, "");
+      const snapshot = await control(caller, "diagnostics");
+      assert.equal(snapshot.discovery.routes[provider.hostname], providerId);
     }
-    await a.command("unpair", bId);
+    await control(a, "unpair", bId);
     assert.deepEqual(JSON.parse(await a.command("peers")).routes, {});
     assert.equal((await request(client, a, b.hostname)).status, 404);
     assert.equal((await request(client, a, a.hostname)).status, 200);

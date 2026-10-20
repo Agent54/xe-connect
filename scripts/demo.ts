@@ -7,6 +7,13 @@ const SCRIPT = fileURLToPath(import.meta.url);
 const BINARY = join(ROOT, "target/debug/xe-connect");
 
 export async function buildBinary() {
+  const ui = await new Deno.Command("deno", {
+    args: ["task", "build:ui"],
+    cwd: ROOT,
+    stdout: "inherit",
+    stderr: "inherit",
+  }).output();
+  if (!ui.success) throw new Error("UI build failed");
   const result = await new Deno.Command("cargo", {
     args: ["build", "--locked"],
     cwd: ROOT,
@@ -278,7 +285,7 @@ export class Demo {
     }
   }
 
-  instructions() {
+  async instructions() {
     const command = (computer: Computer, ...args: string[]) =>
       [BINARY, ...computer.argv(...args)].map((arg) =>
         `'${arg.replaceAll("'", "'\\''")}'`
@@ -293,6 +300,15 @@ export class Demo {
       dummy_service: computer.service,
       hostname: computer.hostname,
     })));
+    console.log(
+      "\nOpen these private UI links to pair and test in the browser:",
+    );
+    for (const computer of [this.a, this.b]) {
+      console.log(`${computer.name}: ${await computer.command("ui")}`);
+    }
+    console.log(
+      "Create an invitation in A, paste it in B, then test beta.web.localhost in A.",
+    );
     console.log(
       "In another terminal, create a ticket on A, then paste it into B's command:",
     );
@@ -347,7 +363,7 @@ async function main() {
   Deno.addSignalListener("SIGTERM", stop);
   try {
     await demo.start();
-    demo.instructions();
+    await demo.instructions();
     await stopped.promise;
   } finally {
     await demo.close();

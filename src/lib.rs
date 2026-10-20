@@ -7,6 +7,8 @@ mod protocol;
 mod runtime;
 pub mod state;
 mod tasks;
+#[cfg(feature = "web-ui")]
+mod ui;
 
 pub use agent::Agent;
 pub use config::{Config, Peer};

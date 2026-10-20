@@ -1,0 +1,8 @@
+{
+  "nodeModulesDir": "auto",
+  "tasks": {
+    "build": "deno run --frozen -A npm:vite@8.2.2 build",
+    "dev": "deno run --frozen -A npm:vite@8.2.2 --host 127.0.0.1",
+    "check": "deno run --frozen -A npm:svelte-check@4.4.6 --tsconfig ./tsconfig.json"
+  }
+}

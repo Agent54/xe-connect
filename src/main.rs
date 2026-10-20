@@ -59,6 +59,8 @@ enum Command {
     Unpair { endpoint_id: String },
     /// Print this computer's persistent endpoint ID.
     Id,
+    /// Print a private authenticated link to the running agent's diagnostics UI.
+    Ui,
 }
 
 #[tokio::main]
@@ -204,6 +206,18 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::json!({ "removed": id }));
         }
         Command::Id => println!("{id}"),
+        Command::Ui => {
+            ensure!(
+                cfg!(feature = "web-ui"),
+                "this binary was built without the web-ui feature"
+            );
+            ensure!(running, "start the agent before opening its UI");
+            let config = disk(move || store.read::<Config>()).await?;
+            println!(
+                "http://{}/_xe/ui/#token={}",
+                config.listen, config.control_token
+            );
+        }
     }
     Ok(())
 }

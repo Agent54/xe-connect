@@ -10,11 +10,21 @@ responsible for dispatching hostnames to Docker services and OS daemons.
 
 ## Build
 
-Requires Rust 1.91 or newer.
+Requires Rust 1.91 or newer and Deno 2.7 or newer for the Svelte UI build.
 
 ```sh
-cargo build --release --locked
+deno task build
 ```
+
+This builds `ui/` first, then embeds its HTML, JavaScript, and CSS into
+`target/release/xe-connect`. The installed binary needs neither Deno nor UI files
+beside it. After editing the frontend, rebuild the UI before rebuilding Rust:
+`deno task build:ui && cargo build --locked`. Plain Cargo builds do not run Deno
+or download frontend dependencies automatically; they require `ui/dist` to exist.
+
+For a Rust-only embedding without the UI, use `cargo build --locked
+--no-default-features`, or set `default-features = false` on the library dependency.
+The control API and service tests remain available without the UI.
 
 ## Run
 
@@ -34,6 +44,54 @@ default upstream is `http://127.0.0.1:5196`.
 The agent prints one JSON readiness record to stdout. Diagnostics go to stderr.
 SIGINT or SIGTERM shuts it down. It refuses a non-loopback HTTP listener and a
 second agent using the same state directory.
+
+## Diagnostics UI
+
+With the agent running, print its private browser link:
+
+```sh
+xe-connect --state-dir ./computer-state ui
+```
+
+Open the printed URL. The minimal Svelte app at `/_xe/ui/` shows paired computers,
+selected direct/relay paths and RTT, cached service routes, network/relay reports,
+resource usage, and the complete raw diagnostics snapshot. It refreshes every five
+seconds while the tab is visible. Pairing, invitation creation, unpairing, and an
+explicit service test use the same control API as the CLI.
+
+The link contains the existing local control token in its URL fragment. Keep it
+private: it grants local administration, including pairing. The UI removes the
+fragment from browser history on load and retains the token only in memory; a
+reload needs the private link again. No token is placed in static assets, query
+strings, cookies, or browser storage. `Forget token` clears this tab's UI access;
+the agent, pairings, and peer connections keep running. The static shell
+is public on loopback control hosts; every data/action endpoint still requires
+`Authorization: Bearer …`. Application `.localhost` hosts do not serve the UI.
+An embedding wrapper must protect its browser-facing interface and proxy the
+`/_xe/ui/` assets and appropriate `/_xe/` API endpoints on the same origin.
+
+For frontend development, run the agent on its default port and
+`deno task --cwd ui dev`. Open `http://127.0.0.1:5173/_xe/ui/`; enter the agent's
+token manually or reuse the private link's fragment on that origin. Vite proxies
+the supported API calls to port 5198. `deno task check:ui` runs Svelte/TypeScript
+checks. There is no SvelteKit server or router dependency.
+
+### Explicit service check
+
+`POST /_xe/test` accepts `{"hostname":"notes.localhost"}` with the local control
+token. It runs the normal local HEAD probe, cached-provider lookup, and
+first-positive peer discovery, then sends **GET /** without cookies, authorization,
+or redirects. It can start containers and update the route cache. Passive
+`GET /_xe/diagnostics` continues to do neither.
+
+The result includes `hostname`, `provider` (`local`, `peer`, or `none`), `peer_id`,
+HTTP `status`, `elapsed_ms`, `body_preview`, and `truncated`. It has a 20-second
+overall deadline and reads at most 4 KiB plus one body frame to detect truncation.
+The preview is rendered as text, never executed as HTML. Only the existing one-
+and two-label `.localhost` hostnames are accepted; arbitrary URLs, methods, paths,
+and headers cannot be supplied. An unavailable service returns status 404 inside
+the result; malformed input or operational failure produces an API error.
+Library callers can use `Agent::test_service(hostname).await` without a listener.
 
 ## Pair
 
@@ -333,8 +391,10 @@ the other computer's service.
 | A | 5210 | 5211 | 5212 | `alpha.localhost` |
 | B | 5220 | 5221 | 5222 | `beta.web.localhost` |
 
-All listeners use `127.0.0.1`. Pairing stays manual: the script prints the exact
-`invite` and `pair` commands to run in another terminal. Before pairing, each
+All listeners use `127.0.0.1`. The script prints a private diagnostics UI link for
+each computer. Open both, create an invitation in A, paste it into B, and test
+`beta.web.localhost` from A or `alpha.localhost` from B. Pairing stays manual; the
+script also prints the exact `invite` and `pair` commands for terminal use. Before pairing, each
 agent serves only its own hostname. After pairing, open
 `http://beta.web.localhost:5210/` to reach B through A, or
 `http://alpha.localhost:5220/` to reach A through B. The response identifies the
@@ -347,8 +407,10 @@ use `--state-dir target/another-demo` for a fresh setup. Use `--base-port 5310`
 to move all six ports, or `--no-build` to reuse the debug binary.
 
 The Deno integration test imports that same setup, uses fresh state and unused
-ports, then checks local-only access before pairing, both saved peers, forwarding
-in both directions, POST bodies and query strings, cached routes, and unpairing:
+ports, then checks the embedded UI shell, API authentication, local-only access,
+invitation/pairing through the browser's API and ticket encoder, both saved peers,
+forwarding in both directions, POST bodies and query strings, service-test results,
+diagnostics, cached routes, and unpairing:
 
 ```sh
 deno task test:demo
@@ -370,3 +432,19 @@ unpairing through the actual binary using the default iroh configuration.
 
 Real cross-network NAT traversal and relay fallback still need a two-computer
 smoke test before bundling this with the launcher.
+
+## GitHub builds and int prereleases
+
+`.github/workflows/build.yml` runs checks for pull requests and pushes to `main`
+or `int`, and supports manual builds. It checks Svelte/TypeScript, Deno scripts,
+Rust formatting/Clippy/tests, Rust-only compilation, and the two-computer demo
+integration test before building release binaries with the embedded UI.
+
+Downloads cover Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows x64.
+Each archive contains the binary and this README. Only a successful **push to
+`int`** publishes a GitHub prerelease, tagged `int-RUN_NUMBER-COMMIT`, with all
+archives and `SHA256SUMS`. It is explicitly marked prerelease and never becomes
+the latest stable release. Rerunning the same workflow updates that run's assets.
+Pull requests, `main`, and manual builds only produce workflow artifacts.
+The release job uses the built-in `GITHUB_TOKEN` with `contents: write`; no extra
+release secret is required. Binaries are unsigned.
